@@ -10,6 +10,7 @@ name: iPhone 一键生成晨报数据包
       - tests/**
       - requirements.txt
       - .github/workflows/generate.yml
+      - .github/ndxtmc-trigger.json
 
 permissions:
   contents: read
