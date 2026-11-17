@@ -33,6 +33,8 @@
 
 每次成功还提供 `Nasdaq_Source_Audit.zip`（原始响应及独立验算结果）与 ZIP 的 `.sha256` 文件。
 
+实测与当前部署状态见 [验证记录](docs/VALIDATION.md)。
+
 ## 数据规则
 
 - 每次从 Nasdaq 官方 `WeightingData` 重新取名单，核对证券身份与指数返回的数量，不把成分数永久写死为 47。名单变更会显示实际数量。
