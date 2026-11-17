@@ -62,6 +62,8 @@ python -m scripts.validate_pack output/LATEST_Morning_Report_Data_Pack.zip
 
 仅用于开发的历史回放：`--fixtures 原始JSON目录 --as-of YYYY-MM-DD`。回放文件命名为 `HISTORICAL_REPLAY_Data_Pack.zip`，`DAILY_READY=false`，不能通过实时发布校验。
 
-本项目由前期 Nasdaq 47 股下载器、官方历史端点与晨报数据包格式迁移而来。另有 ChatGPT 定时任务从 2026-11-18 起每天北京时间 08:00 触发更新，并发送结果及下载链接；手机手动运行入口同时保留。定时任务通过更新 .github/ndxtmc-trigger.json 触发现有工作流，按北京时间日期去重；不依赖电脑开机。
+本项目由前期 Nasdaq 47 股下载器、官方历史端点与晨报数据包格式迁移而来。从 2026-11-18 起，由原有「纳指晨报」任务每天北京时间 08:00 启动完整流程：触发 GitHub 更新、等待校验和发布、读取本轮已验证数据、复算指标并补充宏观/情绪研究，最后在原晨报对话推送完整分析。单独的数据更新任务合并停用；手动运行入口保留，不依赖电脑开机。
+
+自动交接使用 `data/latest_morning_input.json`，包含本轮 request_id、提交 SHA、run_id、Release、摘要、完整官方指数序列及独立审计结果，作为一个文件原子发布。晨报必须匹配本轮身份与北京时间日期，避免把上次 READY 文件或上次 Release 当成本次成功。详情见 [自动晨报流程](docs/AUTOMATION.md)。
 
 GitHub App 的手动运行支持见 [官方公告](https://github.blog/changelog/2024-07-30-run-workflows-set-as-workflow_dispatch-manually/)。备用行情接口免费使用不等于可用性承诺；两家接口都失败时不会更新 Release。

@@ -74,6 +74,15 @@ jobs:
           cat output/release_notes.md >> "$GITHUB_STEP_SUMMARY"
           printf '\n[下载最新 ZIP](https://github.com/%s/releases/latest/download/LATEST_Morning_Report_Data_Pack.zip)\n' "$GH_REPO" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Publish validated input for the morning report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: python -m scripts.publish_handoff --output output
+
       - name: Show failure evidence
         if: ${{ failure() }}
         run: |
