@@ -7,10 +7,12 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 
 from scripts.morning_pack import (
     DataError, anomalies, breadth_metrics, build_pack, csv_bytes, latest_completed_session,
-    generate, number, parse_index, parse_members, parse_stock, parse_yahoo_stock, trade_date, wilder_rsi_series,
+    generate, NasdaqClient, number, parse_index, parse_members, parse_stock, parse_yahoo_stock, trade_date, wilder_rsi_series,
 )
 from scripts.validate_pack import audit
 
@@ -163,6 +165,60 @@ class DataSafetyTests(unittest.TestCase):
         stocks = {t:[{"Date":"2026-11-13","Close":100,"Source":provider},{"Date":"2026-11-16","Close":101,"Source":provider}] for t,provider in (("AAPL","Nasdaq"),("MSFT","Yahoo"))}
         with self.assertRaisesRegex(DataError,"mixes providers"):
             build_pack({t:index_rows for t in ("NDXTMC","NDXT","NDX")},[{"Symbol":t} for t in stocks],stocks,"2026-11-16",datetime.now(timezone.utc))
+
+    def test_normal_anonymous_http_session_retains_server_cookie(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/bootstrap":
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", "public_session=test; Path=/")
+                    self.end_headers()
+                    self.wfile.write(b'{"ready":true}')
+                elif self.headers.get("Cookie") == "public_session=test" and self.headers.get("Content-Type") is None:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"history":"available"}')
+                else:
+                    self.send_response(403)
+                    self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                client = NasdaqClient(Path(folder))
+                root = f"http://127.0.0.1:{server.server_port}"
+                client.request(root + "/bootstrap", "bootstrap.json")
+                self.assertEqual(client.request(root + "/history", "history.json")["history"], "available")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+    def test_partial_nasdaq_failure_refetches_the_entire_universe_from_yahoo(self):
+        indices = [{"Date":"2026-11-13", "Close":100, "Constituents":2}, {"Date":"2026-11-16", "Close":101, "Constituents":2}]
+        members = [{"Symbol":"AAPL", "Name":"Apple"}, {"Symbol":"MSFT", "Name":"Microsoft"}]
+        def nasdaq(ticker, target):
+            if ticker == "MSFT":
+                raise DataError("Nasdaq HTTP 403")
+            return [{"Date":"2026-11-16","Close":101,"Source":"Nasdaq"}]
+        def yahoo(ticker, target):
+            return [{"Date":"2026-11-16","Close":101,"Source":"Yahoo"}]
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("scripts.morning_pack.latest_completed_session", return_value="2026-11-16"), \
+             patch("scripts.morning_pack.NasdaqClient.index", return_value=indices), \
+             patch("scripts.morning_pack.NasdaqClient.members", return_value=members), \
+             patch("scripts.morning_pack.NasdaqClient.stock", side_effect=nasdaq), \
+             patch("scripts.morning_pack.YahooClient.stock", side_effect=yahoo) as fallback, \
+             patch("scripts.morning_pack.build_pack", side_effect=DataError("stop after provider check")) as build:
+            with self.assertRaisesRegex(DataError,"stop after provider check"):
+                generate(Path(folder))
+            self.assertEqual(fallback.call_count, 2)
+            downloaded = build.call_args.args[2]
+            self.assertEqual(set(downloaded), {"AAPL","MSFT"})
+            self.assertTrue(all(row["Source"] == "Yahoo" for rr in downloaded.values() for row in rr))
 
 
 if __name__ == "__main__":

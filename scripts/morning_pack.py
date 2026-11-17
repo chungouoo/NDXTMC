@@ -18,13 +18,15 @@ import statistics
 import sys
 import time
 import zipfile
+from http.cookiejar import CookieJar
+from threading import local
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals
@@ -271,6 +273,7 @@ class NasdaqClient:
         self.raw_dir = raw_dir
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.fixtures = fixtures
+        self._http = local()
 
     def request(self, url: str, filename: str, params: dict | None = None) -> dict:
         if self.fixtures:
@@ -279,15 +282,23 @@ class NasdaqClient:
             yahoo = urlsplit(url).hostname == "query1.finance.yahoo.com"
             provider = "Yahoo Finance" if yahoo else "Nasdaq"
             origin = "https://finance.yahoo.com" if yahoo else "https://www.nasdaq.com"
-            request = Request(url, data=urlencode(params).encode() if params else None, headers={
+            data = urlencode(params).encode() if params is not None else None
+            headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*", "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9", "Origin": origin,
                 "Referer": origin + "/",
-            })
+            }
+            if data is not None:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+            request = Request(url, data=data, headers=headers)
+            # A normal anonymous cookie session per worker; no copied credentials,
+            # challenge solving, proxies, or fingerprint manipulation.
+            if not hasattr(self._http, "opener"):
+                self._http.opener = build_opener(HTTPCookieProcessor(CookieJar()))
             for attempt in range(3):
                 try:
-                    with urlopen(request, timeout=25) as response:
+                    with self._http.opener.open(request, timeout=25) as response:
                         raw = response.read(20_000_001)
                     if len(raw) > 20_000_000:
                         raise DataError("Unexpectedly large source response")
@@ -348,6 +359,27 @@ def csv_bytes(rows: list[dict], fields: list[str] | None = None) -> bytes:
     writer.writeheader()
     writer.writerows({k: row.get(k) for k in fields} for row in rows)
     return out.getvalue().encode("utf-8")
+
+
+def fetch_stock_batch(client: NasdaqClient, members: list[dict], target: str, initial: dict | None = None) -> tuple[dict, list]:
+    stocks, failures = dict(initial or {}), []
+    if not stocks:
+        first = members[0]["Symbol"]
+        try:
+            stocks[first] = client.stock(first, target)
+            print(f"{first}: source connectivity OK, {len(stocks[first])} rows", flush=True)
+        except Exception as exc:
+            return {}, [{"Ticker": first, "Error": str(exc)}]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tasks = {pool.submit(client.stock, m["Symbol"], target): m["Symbol"] for m in members if m["Symbol"] not in stocks}
+        for task in as_completed(tasks):
+            ticker = tasks[task]
+            try:
+                stocks[ticker] = task.result()
+                print(f"{ticker}: {len(stocks[ticker])} rows through {stocks[ticker][-1]['Date']}", flush=True)
+            except Exception as exc:
+                failures.append({"Ticker": ticker, "Error": str(exc)})
+    return stocks, failures
 
 
 def indicator_rows(rows: list[dict]) -> list[dict]:
@@ -557,15 +589,15 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
             print(f"{first_ticker}: Yahoo connectivity OK, {len(stocks[first_ticker])} rows", flush=True)
         except Exception as fallback_error:
             raise DataError(f"Stock providers unavailable; stopped before requesting the other constituents. Nasdaq: {exc}; Yahoo: {fallback_error}") from fallback_error
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        tasks = {pool.submit(stock_client.stock, member["Symbol"], target): member["Symbol"] for member in members if member["Symbol"] != first_ticker}
-        for task in as_completed(tasks):
-            ticker = tasks[task]
-            try:
-                stocks[ticker] = task.result()
-                print(f"{ticker}: {len(stocks[ticker])} rows through {stocks[ticker][-1]['Date']}", flush=True)
-            except Exception as exc:
-                failures.append({"Ticker": ticker, "Error": str(exc)})
+    stocks, failures = fetch_stock_batch(stock_client, members, target, stocks)
+    if failures and stock_client is client and not fixtures:
+        write_json(output / "nasdaq_failed_tickers.json", failures)
+        write_json(raw_dir / "nasdaq_provider_failures.json", failures)
+        stock_source_note = f"Nasdaq failed for {len(failures)}/{len(members)} constituents; all constituents refetched using Yahoo Finance chart history"
+        print(stock_source_note, flush=True)
+        # Discard all primary stock rows; never combine vendors for breadth.
+        stock_client = YahooClient(raw_dir)
+        stocks, failures = fetch_stock_batch(stock_client, members, target)
     if failures:
         write_json(output / "failed_tickers.json", failures)
         raise DataError(f"{len(failures)}/{len(members)} stock sources failed; no current pack will be published: " + "; ".join(f"{row['Ticker']}: {row['Error']}" for row in failures[:8]))
@@ -617,7 +649,7 @@ def main() -> int:
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     # Remove only outputs of this script, so a failed rerun cannot publish an old ZIP.
-    for name in ("LATEST_Morning_Report_Data_Pack.zip", "HISTORICAL_REPLAY_Data_Pack.zip", "Nasdaq_Source_Audit.zip", "summary.json", "release_notes.md", "validation.json", "failure.json", "failed_tickers.json", "blocked_quality.json", "LATEST_Morning_Report_Data_Pack.zip.sha256"):
+    for name in ("LATEST_Morning_Report_Data_Pack.zip", "HISTORICAL_REPLAY_Data_Pack.zip", "Nasdaq_Source_Audit.zip", "summary.json", "release_notes.md", "validation.json", "failure.json", "failed_tickers.json", "nasdaq_failed_tickers.json", "blocked_quality.json", "LATEST_Morning_Report_Data_Pack.zip.sha256"):
         (args.output / name).unlink(missing_ok=True)
     for old in (args.output / "sources").glob("*.json"):
         old.unlink()
