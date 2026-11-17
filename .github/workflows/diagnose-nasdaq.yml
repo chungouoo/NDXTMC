@@ -1,0 +1,21 @@
+name: Nasdaq 连接诊断（不生成数据包）
+"on":
+  workflow_dispatch:
+  push:
+    branches: [codex/nasdaq-connection-check]
+    paths:
+      - scripts/diagnose_nasdaq.py
+      - .github/workflows/diagnose-nasdaq.yml
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Bounded anonymous HTTP compatibility check
+        run: python3 scripts/diagnose_nasdaq.py
