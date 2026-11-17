@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.morning_pack import (
-    DataError, anomalies, breadth_metrics, csv_bytes, latest_completed_session,
-    generate, number, parse_index, parse_members, parse_stock, trade_date, wilder_rsi_series,
+    DataError, anomalies, breadth_metrics, build_pack, csv_bytes, latest_completed_session,
+    generate, number, parse_index, parse_members, parse_stock, parse_yahoo_stock, trade_date, wilder_rsi_series,
 )
 from scripts.validate_pack import audit
 
@@ -126,10 +126,43 @@ class DataSafetyTests(unittest.TestCase):
              patch("scripts.morning_pack.latest_completed_session", return_value="2026-11-16"), \
              patch("scripts.morning_pack.NasdaqClient.index", return_value=indices), \
              patch("scripts.morning_pack.NasdaqClient.members", return_value=members), \
-             patch("scripts.morning_pack.NasdaqClient.stock", side_effect=DataError("Nasdaq HTTP 403")) as fetch_stock:
+             patch("scripts.morning_pack.NasdaqClient.stock", side_effect=DataError("Nasdaq HTTP 403")) as fetch_stock, \
+             patch("scripts.morning_pack.YahooClient.stock", side_effect=DataError("Yahoo HTTP 403")) as fallback:
             with self.assertRaisesRegex(DataError, "stopped before requesting"):
                 generate(Path(folder))
             self.assertEqual(fetch_stock.call_count, 1)
+            self.assertEqual(fallback.call_count, 1)
+
+    def yahoo_payload(self):
+        stamps = [int(datetime(2026, 11, d, 14, 30, tzinfo=timezone.utc).timestamp()) for d in (13, 16)]
+        return {"chart":{"error":None,"result":[{"meta":{"symbol":"TEST","currency":"USD","exchangeTimezoneName":"America/New_York","dataGranularity":"1d","firstTradeDate":stamps[0]},"timestamp":stamps,"indicators":{"quote":[{"open":[99,100],"high":[101,103],"low":[98,99],"close":[100,102],"volume":[100,200]}],"adjclose":[{"adjclose":[70,75]}]}}]}}
+
+    def test_fallback_retains_provider_close_not_adjusted_close(self):
+        rows = parse_yahoo_stock(self.yahoo_payload(), "TEST", "2026-11-16")
+        self.assertEqual(rows[-1]["Close"], 102)
+        self.assertTrue(all(row["Source"].startswith("Yahoo") for row in rows))
+
+    def test_fallback_rejects_truncated_arrays_and_null_prices(self):
+        bad = self.yahoo_payload()
+        bad["chart"]["result"][0]["indicators"]["quote"][0]["close"] = [100]
+        with self.assertRaises(DataError):
+            parse_yahoo_stock(bad, "TEST", "2026-11-16")
+        bad = self.yahoo_payload()
+        bad["chart"]["result"][0]["indicators"]["quote"][0]["close"][1] = None
+        with self.assertRaises(DataError):
+            parse_yahoo_stock(bad, "TEST", "2026-11-16")
+
+    def test_fallback_rejects_missing_older_history(self):
+        bad = self.yahoo_payload()
+        bad["chart"]["result"][0]["meta"]["firstTradeDate"] = int(datetime(2025,1,2,tzinfo=timezone.utc).timestamp())
+        with self.assertRaisesRegex(DataError,"truncated"):
+            parse_yahoo_stock(bad, "TEST", "2026-11-16")
+
+    def test_breadth_cannot_mix_stock_data_providers(self):
+        index_rows = [{"Date":"2026-11-13", "Close":100, "Constituents":2}, {"Date":"2026-11-16", "Close":101, "Constituents":2}]
+        stocks = {t:[{"Date":"2026-11-13","Close":100,"Source":provider},{"Date":"2026-11-16","Close":101,"Source":provider}] for t,provider in (("AAPL","Nasdaq"),("MSFT","Yahoo"))}
+        with self.assertRaisesRegex(DataError,"mixes providers"):
+            build_pack({t:index_rows for t in ("NDXTMC","NDXT","NDX")},[{"Symbol":t} for t in stocks],stocks,"2026-11-16",datetime.now(timezone.utc))
 
 
 if __name__ == "__main__":

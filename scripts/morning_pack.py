@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -230,6 +230,42 @@ def parse_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     return rows
 
 
+def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
+    """Read Yahoo provider Close, never substitute its dividend-adjusted close."""
+    chart = payload.get("chart") or {}
+    result = chart.get("result")
+    if chart.get("error") or not isinstance(result, list) or len(result) != 1:
+        raise DataError(f"{ticker}: Yahoo chart unavailable")
+    data = result[0]
+    meta = data.get("meta") or {}
+    if meta.get("symbol") != ticker or meta.get("currency") != "USD":
+        raise DataError(f"{ticker}: Yahoo symbol/currency mismatch")
+    if meta.get("exchangeTimezoneName") not in ("America/New_York", "US/Eastern") or meta.get("dataGranularity") != "1d":
+        raise DataError(f"{ticker}: Yahoo timezone or interval mismatch")
+    timestamps = data.get("timestamp")
+    quotes = (data.get("indicators") or {}).get("quote")
+    if not isinstance(timestamps, list) or not timestamps or not isinstance(quotes, list) or len(quotes) != 1:
+        raise DataError(f"{ticker}: Yahoo empty price arrays")
+    quote = quotes[0]
+    keys = ("open", "high", "low", "close", "volume")
+    if not all(isinstance(quote.get(k), list) and len(quote[k]) == len(timestamps) for k in keys):
+        raise DataError(f"{ticker}: Yahoo price-array length mismatch")
+    provider_rows = []
+    for i, timestamp in enumerate(timestamps):
+        stamp = datetime.fromtimestamp(number(timestamp), timezone.utc).astimezone(NY)
+        provider_rows.append({"date": stamp.strftime("%m/%d/%Y"), **{k: quote[k][i] for k in keys}})
+    # Reuse the same OHLC, coverage, date and continuity validation for both vendors.
+    rows = parse_stock({"data": {"symbol": ticker, "totalRecords": len(timestamps), "tradesTable": {"rows": provider_rows}}}, ticker, target)
+    first_trade = datetime.fromtimestamp(number(meta.get("firstTradeDate")), timezone.utc).astimezone(NY).date().isoformat()
+    earliest = max("2025-01-02", first_trade)
+    sessions = sorted(expected_sessions(earliest, target))
+    if not sessions or rows[0]["Date"] != sessions[0]:
+        raise DataError(f"{ticker}: Yahoo history truncated before {rows[0]['Date']}")
+    for row in rows:
+        row["Source"] = "Yahoo Finance chart Close; no local adjustment"
+    return rows
+
+
 class NasdaqClient:
     def __init__(self, raw_dir: Path, fixtures: Path | None = None):
         self.raw_dir = raw_dir
@@ -240,11 +276,14 @@ class NasdaqClient:
         if self.fixtures:
             payload = json.loads((self.fixtures / filename).read_text())
         else:
+            yahoo = urlsplit(url).hostname == "query1.finance.yahoo.com"
+            provider = "Yahoo Finance" if yahoo else "Nasdaq"
+            origin = "https://finance.yahoo.com" if yahoo else "https://www.nasdaq.com"
             request = Request(url, data=urlencode(params).encode() if params else None, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/plain, */*", "Content-Type": "application/x-www-form-urlencoded",
-                "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.nasdaq.com",
-                "Referer": "https://www.nasdaq.com/",
+                "Accept-Language": "en-US,en;q=0.9", "Origin": origin,
+                "Referer": origin + "/",
             })
             for attempt in range(3):
                 try:
@@ -256,14 +295,14 @@ class NasdaqClient:
                     break
                 except HTTPError as exc:
                     if exc.code not in (500, 502, 503, 504) or attempt == 2:
-                        raise DataError(f"Nasdaq HTTP {exc.code}; no permission/rate-limit bypass") from exc
+                        raise DataError(f"{provider} HTTP {exc.code}; no permission/rate-limit bypass") from exc
                     time.sleep(attempt + 1)
                 except (URLError, TimeoutError) as exc:
                     if attempt == 2:
-                        raise DataError("Nasdaq network request failed after 3 attempts") from exc
+                        raise DataError(f"{provider} network request failed after 3 attempts") from exc
                     time.sleep(attempt + 1)
         if not isinstance(payload, dict):
-            raise DataError("Nasdaq response is not a JSON object")
+            raise DataError("Market-data response is not a JSON object")
         write_json(self.raw_dir / filename, payload)
         return payload
 
@@ -286,6 +325,16 @@ class NasdaqClient:
             "assetclass": "stocks", "fromdate": "2025-01-02", "todate": target, "limit": 5000,
         })
         return parse_stock(self.request(url, f"raw_stock_{ticker}.json"), ticker, target)
+
+
+class YahooClient(NasdaqClient):
+    def stock(self, ticker: str, target: str):
+        start = int(datetime(2025, 1, 2, tzinfo=NY).timestamp())
+        end = int(datetime.combine(date.fromisoformat(target) + timedelta(days=1), datetime.min.time(), NY).timestamp())
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?" + urlencode({
+            "period1": start, "period2": end, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true",
+        })
+        return parse_yahoo_stock(self.request(url, f"raw_yahoo_stock_{ticker}.json"), ticker, target)
 
 
 def write_json(path: Path, value) -> None:
@@ -355,13 +404,15 @@ def anomalies(stocks: dict[str, list[dict]]) -> list[dict]:
             if abs(change) < EXTREME_THRESHOLD_PCT:
                 continue
             reviewed = REVIEWED_EXTREMES.get((ticker, row["Date"]))
-            matched = reviewed is not None and abs(reviewed[0] - prior["Close"]) < 1e-6 and abs(reviewed[1] - row["Close"]) < 1e-6
+            # Yahoo chart values may be serialized from float32 (a few millionths).
+            tolerance = 1e-4 if row.get("Source", "").startswith("Yahoo") else 1e-6
+            matched = reviewed is not None and abs(reviewed[0] - prior["Close"]) < tolerance and abs(reviewed[1] - row["Close"]) < tolerance
             result.append({"Ticker": ticker, "Date": row["Date"], "PreviousClose": prior["Close"], "Close": row["Close"],
                            "ChangePct": change, "Note": "CARRIED_REVIEWED_SNAPSHOT; original source prices retained" if matched else "UNREVIEWED_EXTREME_RETURN; inspect corporate action/source"})
     return result
 
 
-def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict[str, list[dict]], target: str, now: datetime, *, replay: bool = False) -> tuple[dict[str, bytes], dict]:
+def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict[str, list[dict]], target: str, now: datetime, *, replay: bool = False, stock_source_note: str | None = None) -> tuple[dict[str, bytes], dict]:
     count = len(members)
     if set(stocks) != {m["Symbol"] for m in members} or count != indices["NDXTMC"][-1]["Constituents"]:
         raise DataError("Constituent identity/count differs from downloaded stock universe")
@@ -369,6 +420,10 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
         check_sessions(rows, target, ticker)
     for ticker, rows in stocks.items():
         check_sessions(rows, target, ticker)
+    providers = {row["Source"] for rr in stocks.values() for row in rr}
+    if len(providers) != 1:
+        raise DataError("Stock universe mixes providers; a single vendor is required for all constituents")
+    stock_provider = next(iter(providers))
     indicators = {t: indicator_rows(rows) for t, rows in indices.items()}
     latest = [{k: v for k, v in indicators[t][-1].items() if k in ("Date", "Ticker", "Close", "PreviousClose", "return_1d_pct", "return_5d_pct", "return_20d_pct")} |
               {"Source": "Nasdaq HistoryData EOD", "IndexIdentityValidated": True} for t in INDEX_NAMES]
@@ -387,7 +442,7 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     checks = {
         "LATEST_COMPLETED_SESSION": target == latest_completed_session(now) and not replay,
         "INDEX_SESSION_CONTINUITY": True, "CURRENT_CONSTITUENT_IDENTITIES": True,
-        "CURRENT_STOCKS_LATEST": True, "NO_DUPLICATE_TICKER_DATE": True,
+        "CURRENT_STOCKS_LATEST": True, "STOCK_UNIVERSE_SINGLE_PROVIDER": True, "NO_DUPLICATE_TICKER_DATE": True,
         "STOCK_OHLC_VALID": True, "FAILED_TICKERS_CLEAR": True,
         "ANOMALY_CHECK_REVIEWED": not critical, "NDXTMC_RSI14": indicators["NDXTMC"][-1]["rsi14_wilder"] is not None,
         "NDXTMC_MA20_40_50_200": all(indicators["NDXTMC"][-1][f"ma{n}"] is not None for n in PERIODS),
@@ -398,6 +453,9 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     warnings = ["SOURCE_ADJUSTMENT_UNKNOWN: source prices retained; not suitable for corporate-action-adjusted backtests",
                 "SOURCE_RECHECK_IS_SAME_SOURCE: no independent supplier validation in this script",
                 "HISTORICAL_POINT_IN_TIME_MEMBERSHIP_UNVERIFIED", "159509_WEIGHT_MAPPING_UNAVAILABLE"]
+    if stock_source_note:
+        warnings.append("STOCK_SOURCE_FALLBACK: " + stock_source_note)
+        warnings.append("YAHOO_PROVIDER_CLOSE: chart quote.close, not adjclose; provider may revise split adjustments; no local adjustment applied")
     warnings.extend(f"REVIEWED_SNAPSHOT_EXTREME: {r['Ticker']} {r['Date']} {r['ChangePct']:.2f}%" for r in anomaly_rows if not r["Note"].startswith("UNREVIEWED"))
     for n in PERIODS:
         if breadth[f"above_ma{n}_valid_count"] != count:
@@ -417,6 +475,7 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     generated = now.astimezone(BJ).isoformat()
     summary = {"run_id": run_id, "generated_at": generated, "as_of_date": target, "daily_ready": ready,
                "backtest_ready": False, "weight_mapping_ready": False,
+               "source_policy": {"indices": "Nasdaq HistoryData EOD", "membership": "Nasdaq WeightingData EOD", "stocks": stock_provider, "stock_fallback_used": bool(stock_source_note), "stock_fallback_reason": stock_source_note},
                "NDXTMC": {"close": value["Close"], "previous_close": value["PreviousClose"], "daily_return_pct": value["return_1d_pct"],
                            "rsi14_wilder": value["rsi14_wilder"], "ndxtmc_rsi14": value["rsi14_wilder"],
                            **{f"ma{n}": value[f"ma{n}"] for n in PERIODS},
@@ -429,6 +488,7 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
         summary[ticker] = {"close": item["Close"], **{f"return_{n}d_pct": item[f"return_{n}d_pct"] for n in (1, 5, 20)}}
     stock_rows = sorted((row for rr in stocks.values() for row in rr), key=lambda r: (r["Date"], r["Ticker"]))
     report = [f"# NDXTMC Core Quality Report — {target}", "", f"Generated at: {generated}", f"Status: {status}", f"DAILY_READY: {ready}",
+              f"Index source: Nasdaq HistoryData EOD", f"Stock source: {stock_provider}", f"Stock fallback reason: {stock_source_note or 'None'}",
               f"Current constituents: {count}", f"Latest stock price distribution: {dict(Counter(rr[-1]['Date'] for rr in stocks.values()))}",
               "BACKTEST_READY: False", "WEIGHT_MAPPING_READY: False", "", "## Checks"]
     report += [f"- {key}: {'PASS' if ok else 'FAIL'}" for key, ok in checks.items()]
@@ -448,7 +508,8 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     for ticker in INDEX_NAMES:
         files[f"{ticker}_index_history.csv"] = csv_bytes(indices[ticker])
     manifest = {"run_id": run_id, "generated_at": generated, "as_of_date": target,
-                "source": "Nasdaq official HistoryData EOD, WeightingData and stock historical endpoints",
+                "source": f"Nasdaq official HistoryData EOD and WeightingData; stock history: {stock_provider}",
+                "source_policy": summary["source_policy"],
                 "source_mode": "HISTORICAL_REPLAY" if replay else "LIVE",
                 "index_rows": {t: len(rr) for t, rr in indices.items()}, "component_count": count,
                 "target_ticker_count": count, "valid_ticker_count": len(stocks), "stocks_latest_date": target,
@@ -478,15 +539,26 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
             raise DataError(f"{ticker}: contradictory repeat EOD response")
     members = client.members(target, indices["NDXTMC"][-1]["Constituents"])
     stocks, failures = {}, []
+    stock_client = client
+    stock_source_note = None
     # Validate the endpoint once before sending requests for the whole universe.
     first_ticker = members[0]["Symbol"]
     try:
         stocks[first_ticker] = client.stock(first_ticker, target)
         print(f"{first_ticker}: connectivity OK, {len(stocks[first_ticker])} rows", flush=True)
     except Exception as exc:
-        raise DataError(f"Nasdaq stock endpoint connectivity failed for {first_ticker}; stopped before requesting the other constituents: {exc}") from exc
+        if fixtures:
+            raise DataError(f"Archived Nasdaq stock response unavailable: {exc}") from exc
+        stock_source_note = f"Nasdaq stock endpoint unavailable ({exc}); all constituents use Yahoo Finance chart history"
+        print(stock_source_note, flush=True)
+        stock_client = YahooClient(raw_dir)
+        try:
+            stocks[first_ticker] = stock_client.stock(first_ticker, target)
+            print(f"{first_ticker}: Yahoo connectivity OK, {len(stocks[first_ticker])} rows", flush=True)
+        except Exception as fallback_error:
+            raise DataError(f"Stock providers unavailable; stopped before requesting the other constituents. Nasdaq: {exc}; Yahoo: {fallback_error}") from fallback_error
     with ThreadPoolExecutor(max_workers=4) as pool:
-        tasks = {pool.submit(client.stock, member["Symbol"], target): member["Symbol"] for member in members if member["Symbol"] != first_ticker}
+        tasks = {pool.submit(stock_client.stock, member["Symbol"], target): member["Symbol"] for member in members if member["Symbol"] != first_ticker}
         for task in as_completed(tasks):
             ticker = tasks[task]
             try:
@@ -497,7 +569,7 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
     if failures:
         write_json(output / "failed_tickers.json", failures)
         raise DataError(f"{len(failures)}/{len(members)} stock sources failed; no current pack will be published: " + "; ".join(f"{row['Ticker']}: {row['Error']}" for row in failures[:8]))
-    files, summary = build_pack(indices, members, stocks, target, now, replay=bool(fixtures))
+    files, summary = build_pack(indices, members, stocks, target, now, replay=bool(fixtures), stock_source_note=stock_source_note)
     if summary["quality"]["critical"]:
         write_json(output / "blocked_quality.json", summary["quality"])
         raise DataError("Quality gate blocked: " + "; ".join(summary["quality"]["critical"]))
@@ -524,6 +596,7 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
     write_json(output / "summary.json", summary)
     release = [f"# 纳指晨报数据包 · {target}", "", f"北京时间生成：{now.astimezone(BJ).isoformat()}",
                f"美股交易日：**{target}**", f"状态：**{summary['quality']['status']}**", f"成分股：**{len(members)}/{len(members)}**", "",
+               f"指数与名单来源：Nasdaq 官方；**个股来源：{summary['source_policy']['stocks']}**。", "",
                f"下载 **{pack.name}**，可直接上传给 ChatGPT 生成晨报。", "", "| 指数 | 收盘 | 当日涨跌 |", "|---|---:|---:|"]
     for ticker in INDEX_NAMES:
         change = summary[ticker].get("daily_return_pct", summary[ticker].get("return_1d_pct"))
