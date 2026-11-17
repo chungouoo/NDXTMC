@@ -6,10 +6,11 @@ import unittest
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.morning_pack import (
     DataError, anomalies, breadth_metrics, csv_bytes, latest_completed_session,
-    number, parse_index, parse_members, parse_stock, trade_date, wilder_rsi_series,
+    generate, number, parse_index, parse_members, parse_stock, trade_date, wilder_rsi_series,
 )
 from scripts.validate_pack import audit
 
@@ -117,6 +118,18 @@ class DataSafetyTests(unittest.TestCase):
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("06_manifest.json", json.dumps({"as_of_date":"2026-11-16","component_count":47,"files":{}}))
             self.assertTrue(audit(path)["errors"])
+
+    def test_stock_access_denial_stops_before_requesting_all_constituents(self):
+        indices = [{"Date":"2026-11-13", "Close":100, "Constituents":47}, {"Date":"2026-11-16", "Close":101, "Constituents":47}]
+        members = [{"Symbol":"AAPL", "Name":"Apple"}, {"Symbol":"MSFT", "Name":"Microsoft"}]
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("scripts.morning_pack.latest_completed_session", return_value="2026-11-16"), \
+             patch("scripts.morning_pack.NasdaqClient.index", return_value=indices), \
+             patch("scripts.morning_pack.NasdaqClient.members", return_value=members), \
+             patch("scripts.morning_pack.NasdaqClient.stock", side_effect=DataError("Nasdaq HTTP 403")) as fetch_stock:
+            with self.assertRaisesRegex(DataError, "stopped before requesting"):
+                generate(Path(folder))
+            self.assertEqual(fetch_stock.call_count, 1)
 
 
 if __name__ == "__main__":

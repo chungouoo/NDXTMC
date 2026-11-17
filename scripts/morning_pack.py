@@ -241,8 +241,9 @@ class NasdaqClient:
             payload = json.loads((self.fixtures / filename).read_text())
         else:
             request = Request(url, data=urlencode(params).encode() if params else None, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; NDXTMC-Morning/1.0)",
-                "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*", "Content-Type": "application/x-www-form-urlencoded",
+                "Accept-Language": "en-US,en;q=0.9", "Origin": "https://www.nasdaq.com",
                 "Referer": "https://www.nasdaq.com/",
             })
             for attempt in range(3):
@@ -477,8 +478,15 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
             raise DataError(f"{ticker}: contradictory repeat EOD response")
     members = client.members(target, indices["NDXTMC"][-1]["Constituents"])
     stocks, failures = {}, []
+    # Validate the endpoint once before sending requests for the whole universe.
+    first_ticker = members[0]["Symbol"]
+    try:
+        stocks[first_ticker] = client.stock(first_ticker, target)
+        print(f"{first_ticker}: connectivity OK, {len(stocks[first_ticker])} rows", flush=True)
+    except Exception as exc:
+        raise DataError(f"Nasdaq stock endpoint connectivity failed for {first_ticker}; stopped before requesting the other constituents: {exc}") from exc
     with ThreadPoolExecutor(max_workers=4) as pool:
-        tasks = {pool.submit(client.stock, member["Symbol"], target): member["Symbol"] for member in members}
+        tasks = {pool.submit(client.stock, member["Symbol"], target): member["Symbol"] for member in members if member["Symbol"] != first_ticker}
         for task in as_completed(tasks):
             ticker = tasks[task]
             try:
