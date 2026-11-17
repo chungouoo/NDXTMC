@@ -1,0 +1,89 @@
+name: iPhone 一键生成晨报数据包
+
+"on":
+  workflow_dispatch:
+  public:
+  push:
+    branches: [main]
+    paths:
+      - scripts/**
+      - tests/**
+      - requirements.txt
+      - .github/workflows/generate.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: morning-data-pack
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: 校验、抓取 Nasdaq、发布 ZIP
+    # A private repository job would consume the account's shared included
+    # compute allowance. Never allocate a runner unless the repository is public.
+    if: ${{ github.event.repository.private == false && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned dependencies without an Actions cache
+        run: python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
+
+      - name: Test market sessions and data failure checks
+        run: python -m unittest discover -s tests -v
+
+      - name: Download and independently validate the latest completed session
+        run: python -m scripts.morning_pack --output output
+
+      - name: Publish downloadable data pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trade_date=$(python -c 'import json; s=json.load(open("output/summary.json")); assert s["daily_ready"] is True; print(s["as_of_date"])')
+          tag="data-${trade_date}-${RUN_ID}-${RUN_ATTEMPT}"
+          gh release create "$tag" \
+            output/LATEST_Morning_Report_Data_Pack.zip \
+            output/LATEST_Morning_Report_Data_Pack.zip.sha256 \
+            output/Nasdaq_Source_Audit.zip \
+            output/validation.json \
+            --repo "$GH_REPO" \
+            --target "$SOURCE_SHA" \
+            --title "纳指晨报数据包 · ${trade_date}" \
+            --notes-file output/release_notes.md \
+            --latest
+          cat output/release_notes.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n[下载最新 ZIP](https://github.com/%s/releases/latest/download/LATEST_Morning_Report_Data_Pack.zip)\n' "$GH_REPO" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show failure evidence
+        if: ${{ failure() }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          lines = ["## 本次未发布新数据包", "", "检查失败步骤日志；上次成功的 Release 会保留原交易日。"]
+          p = Path("output/failure.json")
+          if p.exists():
+              failure = json.loads(p.read_text())
+              lines += ["", "```json", json.dumps(failure, ensure_ascii=False, indent=2), "```"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PY

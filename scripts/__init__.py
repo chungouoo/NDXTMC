@@ -1,0 +1,1 @@
+"""NDXTMC morning data pack."""
