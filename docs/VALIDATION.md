@@ -6,11 +6,19 @@
 
 **GitHub 云端抓取、打包、独立验算、Release 发布和实际下载均已通过。**
 
-- [成功的 GitHub Actions 运行](https://github.com/chungouoo/NDXTMC/actions/runs/44035573665)
-- [已发布的数据包](https://github.com/chungouoo/NDXTMC/releases/tag/data-2026-11-16-44035573665-1)
-- [下载此版本 ZIP](https://github.com/chungouoo/NDXTMC/releases/download/data-2026-11-16-44035573665-1/LATEST_Morning_Report_Data_Pack.zip)
+- [成功的 GitHub Actions 运行](https://github.com/chungouoo/NDXTMC/actions/runs/44038926561)
+- [已发布的数据包](https://github.com/chungouoo/NDXTMC/releases/tag/data-2026-11-16-44038926561-1)
+- [下载此版本 ZIP](https://github.com/chungouoo/NDXTMC/releases/download/data-2026-11-16-44038926561-1/LATEST_Morning_Report_Data_Pack.zip)
 
-数据发布于北京时间 **15:02:22**，对应 **2026-11-16 美股 EOD**。运行使用公开仓库的标准 ubuntu-24.04 运行器，没有付费 API、Actions Artifact 或 Actions 缓存。
+数据发布于北京时间 **15:28:32**，对应 **2026-11-16 美股 EOD**。运行使用公开仓库的标准 ubuntu-24.04 运行器，没有付费 API、Actions Artifact 或 Actions 缓存。
+
+## Nasdaq 兼容性复核（15:28）
+
+- [短历史诊断](https://github.com/chungouoo/NDXTMC/actions/runs/44037939605) 返回 HTTP 200，取得 AAPL 两行数据。
+- [完整历史对照诊断](https://github.com/chungouoo/NDXTMC/actions/runs/44038225895) 在同一运行器上，普通 GET 和带原有 Content-Type 的 GET 均返回 HTTP 200、470 行 AAPL 历史。
+- 正式 47 股生产任务使用正常匿名 HTTP 会话、区分 GET/POST 后，Nasdaq 首次取数仍返回 HTTP 403，随后 Yahoo 完整接管并发布成功。
+- 因而当前未能稳定消除 Nasdaq 的 403。具体是否与出口、会话或服务端规则有关未核实，不能断言整个 GitHub 云端永久被封禁，也不能把恢复归因于某个请求头。
+- 保留 Nasdaq 优先、失败使用 Yahoo 的生产策略；新增“Nasdaq 部分个股失败时整组重新从 Yahoo 获取”的保护。所有个股仍来自同一供应商，避免混源广度。
 
 ## 原因与修复
 
@@ -22,13 +30,13 @@ Nasdaq 的指数 HistoryData 和成分名单 WeightingData 均可在 GitHub 云�
 
 | 检查 | 结果 |
 |---|---|
-| 自动测试 | 15 项通过（GitHub 云端实测） |
+| 自动测试 | 17 项通过（GitHub 云端实测） |
 | Nasdaq 指数与当期成分名单 | 通过 |
 | 个股供应商 | 全部 47 只统一为 Yahoo Finance chart Close |
 | 数据日期 | 2026-11-16，47/47 股完整覆盖 |
 | 个股历史 | 22,004 行 |
 | 指数历史条数 | NDXTMC 1,170；NDXT 470；NDX 470 |
-| 结果 ZIP | 13 文件，766,930 字节 |
+| 结果 ZIP | 13 文件，766,932 字节 |
 | 独立 ZIP 验算 | PASS_WITH_SOURCE_CAVEAT，0 错误 |
 | manifest | 12 个文件大小与 SHA256 全部通过 |
 | Release 发布 | 成功，包含数据包、SHA256、源响应审计包、validation.json |
@@ -36,12 +44,12 @@ Nasdaq 的指数 HistoryData 和成分名单 WeightingData 均可在 GitHub 云�
 
 本次发布 ZIP 的 SHA256：
 
-c8b1dad6d5985bcd81acb7d8038cf2af27ef0b70e5886a6a3192dc0fc5bc8478
+4c228e129711a3e7ff3db04a4c4b1b1a0c0fd9f69c63151a7da0dfc23a63af33
 
 ## 数据口径与局限
 
 - Yahoo 使用 indicators.quote.close，不使用 adjclose；不在本地修复或调整价格。供应商仍可能回溯调整历史分拆口径，复权状态警告保留。
-- 两源历史价格不能视为逐行等同。本次对本地取得的 Nasdaq 历史与发布包比较 22,004 行收盘价，最大历史绝对差约 3.3593 美元（TRI，2025-07-14）；2026-11-16 最大绝对差约 0.00504 美元。差异的具体企业行动或供应商原因未核实，未用比例强行修正。
+- 两源历史价格不能视为逐行等同。早先对本地取得的 Nasdaq 历史与 15:02 发布包比较 22,004 行收盘价，最大历史绝对差约 3.3593 美元（TRI，2025-07-14）；2026-11-16 最大绝对差约 0.00504 美元。差异的具体企业行动或供应商原因未核实，未用比例强行修正。
 - 本次 MA40 广度两源均为 10/47；这不是所有日期或所有指标永远一致的承诺。整组个股必须使用同一来源，不拼接供应商。
 - 指数重复核查属于同源一致性检查，没有声称获得另一供应商的独立认证。
 - 历史时点成分回测、159509 权重映射未完成；DAILY_READY 仅代表当期核心数据通过所列检查。
