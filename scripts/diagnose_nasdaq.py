@@ -19,8 +19,8 @@ jar = http.cookiejar.CookieJar()
 opener = build_opener(HTTPCookieProcessor(jar))
 results = []
 
-def check(label, url, html=False):
-    request = Request(url, headers={**HEADERS, **({"Accept":"text/html"} if html else {})})
+def check(label, url, html=False, content_type=False):
+    request = Request(url, headers={**HEADERS, **({"Accept":"text/html"} if html else {}), **({"Content-Type":"application/x-www-form-urlencoded"} if content_type else {})})
     try:
         response = opener.open(request, timeout=20)
     except HTTPError as error:
@@ -31,7 +31,7 @@ def check(label, url, html=False):
         print(json.dumps(result), flush=True)
         return False, False
     with response:
-        body = response.read(32768)
+        body = response.read(2000000)
         status = response.status
         headers = response.headers
     text = body.decode("utf-8",errors="replace")
@@ -51,11 +51,9 @@ def check(label, url, html=False):
     print(json.dumps(result),flush=True)
     return status==200 and (html or result.get("rows",0)>0), denied
 
-ok, blocked = check("direct_short_history", API)
-# A normal anonymous page bootstrap is attempted only when the API did not
-# present an explicit security challenge. No cookies or token values are logged.
-if not ok and not blocked:
-    page_ok, page_blocked = check("anonymous_page_bootstrap", PAGE, html=True)
-    if page_ok and not page_blocked:
-        ok, blocked = check("history_after_normal_page", API)
-print(json.dumps({"conclusion":"NASDAQ_ACCESS_AVAILABLE" if ok else "NASDAQ_ACCESS_UNAVAILABLE_KEEP_YAHOO","production_changed":False,"checks":results}),flush=True)
+FULL_API = "https://api.nasdaq.com/api/quote/AAPL/historical?assetclass=stocks&fromdate=2025-01-02&todate=2026-11-16&limit=5000"
+plain_ok, plain_blocked = check("full_history_normal_get", FULL_API)
+# Compare the existing production GET header using the same runner and session.
+# Explicit challenges are never solved.
+header_ok, header_blocked = check("full_history_existing_get_content_type", FULL_API, content_type=True) if not plain_blocked else (False, True)
+print(json.dumps({"conclusion":"NASDAQ_NORMAL_GET_AVAILABLE" if plain_ok else "NASDAQ_FULL_HISTORY_UNAVAILABLE_KEEP_YAHOO","normal_get_ok":plain_ok,"existing_header_ok":header_ok,"production_changed":False,"checks":results}),flush=True)
