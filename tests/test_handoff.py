@@ -1,10 +1,22 @@
 import copy
 import unittest
 
-from scripts.publish_handoff import validate_inputs
+from scripts.publish_handoff import request_for_run, validate_inputs
 
 
 class HandoffGateTests(unittest.TestCase):
+    def test_scheduled_run_uses_beijing_request_date(self):
+        run = {"id": 123, "event": "schedule", "created_at": "2026-11-19T23:23:22Z"}
+        request = request_for_run(run)
+        self.assertEqual(request["request_id"], "ndxtmc-daily-2026-11-20")
+        self.assertEqual(request["requested_at"], "2026-11-20T07:23:22+08:00")
+        self.assertEqual(request["timezone"], "Asia/Shanghai")
+
+    def test_manual_run_gets_its_own_request_id(self):
+        run = {"id": 245, "event": "workflow_dispatch", "created_at": "2026-11-19T03:20:26Z"}
+        request = request_for_run(run)
+        self.assertEqual(request["request_id"], "ndxtmc-workflow_dispatch-2026-11-19-245")
+
     def samples(self):
         summary = {"as_of_date":"2026-11-16", "daily_ready":True,
                    "quality":{"daily_ready":True,"critical":[],"checks":{"LATEST_COMPLETED_SESSION":True}},

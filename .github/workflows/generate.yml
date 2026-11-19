@@ -1,6 +1,9 @@
 name: iPhone 一键生成晨报数据包
 
 "on":
+  schedule:
+    - cron: '23 7 * * *'
+      timezone: Asia/Shanghai
   workflow_dispatch:
   public:
   push:
@@ -28,6 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout source

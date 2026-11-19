@@ -19,14 +19,14 @@ import sys
 import time
 import zipfile
 from http.cookiejar import CookieJar
-from threading import local
-from collections import Counter
+from threading import Lock, local
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals
@@ -35,6 +35,8 @@ NY = ZoneInfo("America/New_York")
 BJ = ZoneInfo("Asia/Shanghai")
 PERIODS = (20, 40, 50, 200)
 EXTREME_THRESHOLD_PCT = 40.0
+YAHOO_CLOSE_SOURCE = "Yahoo Finance chart Close; no local adjustment"
+STOCK_HISTORY_FILE = "NDXTMC_47stocks_history.csv"
 INDEX_NAMES = {
     "NDXTMC": "NASDAQ-100 Technology Sector Market-Cap Weighted Index",
     "NDXT": "NASDAQ-100 Technology Sector Index",
@@ -56,6 +58,13 @@ REVIEWED_EXTREMES = {
 
 class DataError(ValueError):
     """Source is incomplete, stale, contradictory, or malformed."""
+
+
+class TruncatedYahooHistory(DataError):
+    def __init__(self, ticker: str, rows: list[dict], first_session: str):
+        super().__init__(f"{ticker}: Yahoo history truncated before {rows[0]['Date']}")
+        self.rows = rows
+        self.first_session = first_session
 
 
 def calendar(now: datetime | None = None):
@@ -261,11 +270,74 @@ def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     first_trade = datetime.fromtimestamp(number(meta.get("firstTradeDate")), timezone.utc).astimezone(NY).date().isoformat()
     earliest = max("2025-01-02", first_trade)
     sessions = sorted(expected_sessions(earliest, target))
-    if not sessions or rows[0]["Date"] != sessions[0]:
-        raise DataError(f"{ticker}: Yahoo history truncated before {rows[0]['Date']}")
     for row in rows:
-        row["Source"] = "Yahoo Finance chart Close; no local adjustment"
+        row["Source"] = YAHOO_CLOSE_SOURCE
+    if not sessions or rows[0]["Date"] < sessions[0]:
+        raise DataError(f"{ticker}: Yahoo rows precede the reported first trading session")
+    if rows[0]["Date"] > sessions[0]:
+        raise TruncatedYahooHistory(ticker, rows, sessions[0])
     return rows
+
+
+def read_previous_yahoo_pack(handoff: Path) -> tuple[dict[str, list[dict]], dict]:
+    snapshot = json.loads(handoff.read_text(encoding="utf-8"))
+    summary, manifest, validation = (snapshot[key] for key in ("data", "manifest", "validation"))
+    pipeline = snapshot["pipeline"]
+    if (snapshot["status"] != "READY" or summary["daily_ready"] is not True
+            or manifest["source_mode"] != "LIVE" or manifest["quality_gate"] != "PASS"
+            or validation["result"] not in ("PASS", "PASS_WITH_SOURCE_CAVEAT") or validation["errors"] != []
+            or summary["source_policy"]["stocks"] != YAHOO_CLOSE_SOURCE
+            or summary["as_of_date"] != manifest["as_of_date"]
+            or summary["as_of_date"] != validation["as_of_date"]):
+        raise DataError("Previous pack is not an audited live Yahoo Finance pack")
+    repo = os.environ.get("GITHUB_REPOSITORY", "chungouoo/NDXTMC")
+    tag = f"data-{summary['as_of_date']}-{pipeline['run_id']}-{pipeline['run_attempt']}"
+    url = f"https://github.com/{repo}/releases/download/{tag}/LATEST_Morning_Report_Data_Pack.zip"
+    if pipeline["repository"] != repo or pipeline["zip_url"] != url or not re.fullmatch(r"data-\d{4}-\d{2}-\d{2}-\d+-\d+", tag):
+        raise DataError("Previous pack does not match the repository release")
+    with urlopen(url, timeout=25) as response:
+        packed = response.read(16_000_001)
+    digest = hashlib.sha256(packed).hexdigest()
+    if len(packed) > 16_000_000 or digest != pipeline["zip_sha256"]:
+        raise DataError("Previous pack ZIP checksum mismatch")
+    with zipfile.ZipFile(io.BytesIO(packed)) as archive:
+        if json.loads(archive.read("06_manifest.json")) != manifest:
+            raise DataError("Previous pack manifest does not match its handoff")
+        raw = archive.read(STOCK_HISTORY_FILE)
+    if hashlib.sha256(raw).hexdigest() != manifest["files"][STOCK_HISTORY_FILE]["sha256"]:
+        raise DataError("Previous pack stock history checksum mismatch")
+    histories = defaultdict(list)
+    for row in csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))):
+        if row["Source"] != YAHOO_CLOSE_SOURCE:
+            raise DataError("Previous pack stock history contains a different stock data provider")
+        for key in ("Open", "High", "Low", "Close"):
+            row[key] = number(row[key])
+        row["Volume"] = int(row["Volume"])
+        histories[row["Ticker"]].append(row)
+    return histories, {"as_of_date": summary["as_of_date"], "zip_url": url, "zip_sha256": digest}
+
+
+def recover_yahoo_history(ticker: str, target: str, short: TruncatedYahooHistory, previous: list[dict]) -> tuple[list[dict], dict]:
+    old_by_date = {row["Date"]: row for row in previous}
+    overlaps = [row for row in short.rows if row["Date"] in old_by_date]
+    if not overlaps:
+        raise DataError(f"{ticker}: live Yahoo history does not overlap the previous verified pack")
+    for row in overlaps:
+        day = row["Date"]
+        if any(not math.isclose(row[key], old_by_date[day][key], rel_tol=0, abs_tol=0.0051)
+               for key in ("Open", "High", "Low", "Close")):
+            raise DataError(f"{ticker}: Yahoo OHLC conflict with previous pack on {day}")
+    first_live = short.rows[0]["Date"]
+    prefix = [row for row in previous if row["Date"] < first_live]
+    combined = prefix + short.rows
+    if combined[0]["Date"] != short.first_session:
+        raise DataError(f"{ticker}: recovery still missing Yahoo history before {combined[0]['Date']}")
+    check_sessions(combined, target, ticker)
+    return combined, {
+        "ticker": ticker, "first_live_date": first_live, "carried_sessions": len(prefix),
+        "overlap_dates": [row["Date"] for row in overlaps],
+        "overlap_volume_revisions": sum(row["Volume"] != old_by_date[row["Date"]]["Volume"] for row in overlaps),
+    }
 
 
 class NasdaqClient:
@@ -339,13 +411,36 @@ class NasdaqClient:
 
 
 class YahooClient(NasdaqClient):
+    def __init__(self, raw_dir: Path, *, previous_handoff: Path | None = None):
+        super().__init__(raw_dir)
+        self.previous_handoff = previous_handoff
+        self.previous_pack = None
+        self.previous_pack_lock = Lock()
+        self.history_recoveries: dict[str, dict] = {}
+
     def stock(self, ticker: str, target: str):
         start = int(datetime(2025, 1, 2, tzinfo=NY).timestamp())
         end = int(datetime.combine(date.fromisoformat(target) + timedelta(days=1), datetime.min.time(), NY).timestamp())
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?" + urlencode({
             "period1": start, "period2": end, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true",
         })
-        return parse_yahoo_stock(self.request(url, f"raw_yahoo_stock_{ticker}.json"), ticker, target)
+        payload = self.request(url, f"raw_yahoo_stock_{ticker}.json")
+        try:
+            return parse_yahoo_stock(payload, ticker, target)
+        except TruncatedYahooHistory as short:
+            if self.previous_handoff is None or not self.previous_handoff.is_file():
+                raise
+            with self.previous_pack_lock:
+                if self.previous_pack is None:
+                    self.previous_pack = read_previous_yahoo_pack(self.previous_handoff)
+                histories, provenance = self.previous_pack
+            rows, evidence = recover_yahoo_history(ticker, target, short, histories.get(ticker, []))
+            record = {**evidence, "previous_pack": provenance}
+            write_json(self.raw_dir / f"yahoo_history_recovery_{ticker}.json", record)
+            with self.previous_pack_lock:
+                self.history_recoveries[ticker] = record
+            print(f"{ticker}: recovered {evidence['carried_sessions']} earlier Yahoo sessions; overlap {', '.join(evidence['overlap_dates'])}; live through {target}", flush=True)
+            return rows
 
 
 def write_json(path: Path, value) -> None:
@@ -444,7 +539,8 @@ def anomalies(stocks: dict[str, list[dict]]) -> list[dict]:
     return result
 
 
-def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict[str, list[dict]], target: str, now: datetime, *, replay: bool = False, stock_source_note: str | None = None) -> tuple[dict[str, bytes], dict]:
+def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict[str, list[dict]], target: str, now: datetime, *,
+               replay: bool = False, stock_source_note: str | None = None, stock_history_recovery: list[dict] | None = None) -> tuple[dict[str, bytes], dict]:
     count = len(members)
     if set(stocks) != {m["Symbol"] for m in members} or count != indices["NDXTMC"][-1]["Constituents"]:
         raise DataError("Constituent identity/count differs from downloaded stock universe")
@@ -488,6 +584,8 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     if stock_source_note:
         warnings.append("STOCK_SOURCE_FALLBACK: " + stock_source_note)
         warnings.append("YAHOO_PROVIDER_CLOSE: chart quote.close, not adjclose; provider may revise split adjustments; no local adjustment applied")
+    for item in stock_history_recovery or []:
+        warnings.append(f"YAHOO_HISTORY_RECOVERED: {item['ticker']} used {item['carried_sessions']} earlier sessions from a checksum-verified Yahoo pack; matched live OHLC overlap and uses live rows from {item['first_live_date']}")
     warnings.extend(f"REVIEWED_SNAPSHOT_EXTREME: {r['Ticker']} {r['Date']} {r['ChangePct']:.2f}%" for r in anomaly_rows if not r["Note"].startswith("UNREVIEWED"))
     for n in PERIODS:
         if breadth[f"above_ma{n}_valid_count"] != count:
@@ -515,6 +613,8 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
                            "drawdown_from_stage_high_pct": value["drawdown_from_52w_closing_high_pct"], "stage_high_closing": value["high_52w_closing"]},
                "breadth": breadth, "relative_performance": relative, "quality": quality,
                "membership": {"as_of_date": target, "component_count": count, "components": members, "weights_available": False}}
+    if stock_history_recovery:
+        summary["source_policy"]["stock_history_recovery"] = stock_history_recovery
     for ticker in ("NDXT", "NDX"):
         item = indicators[ticker][-1]
         summary[ticker] = {"close": item["Close"], **{f"return_{n}d_pct": item[f"return_{n}d_pct"] for n in (1, 5, 20)}}
@@ -533,7 +633,7 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
         "03_index_relative_performance.csv": csv_bytes([relative]), "04_breadth_latest.csv": csv_bytes([breadth]),
         "05_quality_report.md": ("\n".join(report) + "\n").encode(),
         "07_morning_report_input.json": (json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode(),
-        "NDXTMC_47stocks_history.csv": csv_bytes(stock_rows),
+        STOCK_HISTORY_FILE: csv_bytes(stock_rows),
         "failed_tickers.csv": csv_bytes([], ["Ticker", "Error"]),
         "anomaly_check.csv": csv_bytes(anomaly_rows, ["Ticker", "Date", "PreviousClose", "Close", "ChangePct", "Note"]),
     }
@@ -553,7 +653,7 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
     return files, summary
 
 
-def generate(output: Path, fixtures: Path | None = None, as_of: str | None = None) -> dict:
+def generate(output: Path, fixtures: Path | None = None, as_of: str | None = None, *, previous_handoff: Path | None = None) -> dict:
     now = datetime.now(timezone.utc)
     latest = latest_completed_session(now)
     target = as_of or latest
@@ -583,7 +683,7 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
             raise DataError(f"Archived Nasdaq stock response unavailable: {exc}") from exc
         stock_source_note = f"Nasdaq stock endpoint unavailable ({exc}); all constituents use Yahoo Finance chart history"
         print(stock_source_note, flush=True)
-        stock_client = YahooClient(raw_dir)
+        stock_client = YahooClient(raw_dir, previous_handoff=previous_handoff)
         try:
             stocks[first_ticker] = stock_client.stock(first_ticker, target)
             print(f"{first_ticker}: Yahoo connectivity OK, {len(stocks[first_ticker])} rows", flush=True)
@@ -596,12 +696,16 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
         stock_source_note = f"Nasdaq failed for {len(failures)}/{len(members)} constituents; all constituents refetched using Yahoo Finance chart history"
         print(stock_source_note, flush=True)
         # Discard all primary stock rows; never combine vendors for breadth.
-        stock_client = YahooClient(raw_dir)
+        stock_client = YahooClient(raw_dir, previous_handoff=previous_handoff)
         stocks, failures = fetch_stock_batch(stock_client, members, target)
     if failures:
         write_json(output / "failed_tickers.json", failures)
         raise DataError(f"{len(failures)}/{len(members)} stock sources failed; no current pack will be published: " + "; ".join(f"{row['Ticker']}: {row['Error']}" for row in failures[:8]))
-    files, summary = build_pack(indices, members, stocks, target, now, replay=bool(fixtures), stock_source_note=stock_source_note)
+    recovered = []
+    if isinstance(stock_client, YahooClient):
+        recovered = [stock_client.history_recoveries[ticker] for ticker in sorted(stock_client.history_recoveries)]
+    files, summary = build_pack(indices, members, stocks, target, now, replay=bool(fixtures),
+                                stock_source_note=stock_source_note, stock_history_recovery=recovered)
     if summary["quality"]["critical"]:
         write_json(output / "blocked_quality.json", summary["quality"])
         raise DataError("Quality gate blocked: " + "; ".join(summary["quality"]["critical"]))
@@ -646,6 +750,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("output"))
     parser.add_argument("--fixtures", type=Path, help="Replay archived official JSON responses; never labelled live")
     parser.add_argument("--as-of", help="Historical replay date only, YYYY-MM-DD")
+    parser.add_argument("--previous-handoff", type=Path, default=Path("data/latest_morning_input.json"),
+                        help="Previous validated handoff for recovering truncated same-provider Yahoo history")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     # Remove only outputs of this script, so a failed rerun cannot publish an old ZIP.
@@ -654,7 +760,7 @@ def main() -> int:
     for old in (args.output / "sources").glob("*.json"):
         old.unlink()
     try:
-        generate(args.output, args.fixtures, args.as_of)
+        generate(args.output, args.fixtures, args.as_of, previous_handoff=args.previous_handoff)
         return 0
     except Exception as exc:
         failure = {"status": "BLOCKED", "daily_ready": False, "generated_at": datetime.now(BJ).isoformat(), "error": str(exc), "type": type(exc).__name__}

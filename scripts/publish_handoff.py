@@ -14,12 +14,29 @@ import subprocess
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .validate_pack import audit
 
 HANDOFF_PATH = "data/latest_morning_input.json"
 PACK_NAME = "LATEST_Morning_Report_Data_Pack.zip"
+BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+def request_for_run(run: dict) -> dict:
+    created = datetime.fromisoformat(run["created_at"])
+    if created.tzinfo is None:
+        raise ValueError("GitHub run timestamp is missing its timezone")
+    requested = created.astimezone(BEIJING)
+    day = requested.date().isoformat()
+    event = run["event"]
+    if event == "schedule":
+        request_id = f"ndxtmc-daily-{day}"
+    else:
+        request_id = f"ndxtmc-{event}-{day}-{run['id']}"
+    return {"schema_version": 1, "request_id": request_id, "requested_at": requested.isoformat(),
+            "timezone": BEIJING.key, "reason": event}
 
 
 def validate_inputs(summary: dict, manifest: dict, validation: dict) -> None:
@@ -81,11 +98,12 @@ def build_handoff(pack: Path, trigger: dict, context: dict, release: dict) -> di
         raise ValueError("Handoff blocked: release ZIP digest mismatch")
     return {
         "schema_version": 1, "status": "READY",
-        "handoff_generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+        "handoff_generated_at": datetime.now(BEIJING).isoformat(),
         "request_id": trigger["request_id"], "requested_at": trigger["requested_at"],
-        "beijing_request_date": requested.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+        "beijing_request_date": requested.astimezone(BEIJING).date().isoformat(),
         "pipeline": {
             "repository": context["repository"], "source_commit_sha": context["source_commit_sha"],
+            "event": context["event"],
             "run_id": str(context["run_id"]), "run_attempt": str(context["run_attempt"]),
             "run_url": f"https://github.com/{context['repository']}/actions/runs/{context['run_id']}",
             "release_tag": expected_tag, "release_url": release["html_url"],
@@ -101,7 +119,7 @@ def build_handoff(pack: Path, trigger: dict, context: dict, release: dict) -> di
     }
 
 
-def gh_api(path: str, *, body: dict | None = None, allow_missing: bool = False) -> dict | None:
+def gh_api(path: str, *, body: dict | None = None, allow_missing: bool = False) -> dict | list | None:
     command = ["gh", "api", path]
     if body is not None:
         command += ["--method", "PUT", "--input", "-"]
@@ -119,16 +137,26 @@ def main() -> None:
     parser.add_argument("--trigger", type=Path, default=Path(".github/ndxtmc-trigger.json"))
     args = parser.parse_args()
     context = {"repository": os.environ["GH_REPO"], "source_commit_sha": os.environ["SOURCE_SHA"],
-               "run_id": os.environ["RUN_ID"], "run_attempt": os.environ["RUN_ATTEMPT"]}
+               "run_id": os.environ["RUN_ID"], "run_attempt": os.environ["RUN_ATTEMPT"],
+               "event": os.environ["GITHUB_EVENT_NAME"]}
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", context["repository"]):
         raise ValueError("Invalid repository name")
-    trigger = json.loads(args.trigger.read_text())
+    repo_path = f"repos/{context['repository']}"
+    run = gh_api(f"{repo_path}/actions/runs/{context['run_id']}")
+    if str(run["id"]) != context["run_id"] or run["head_sha"] != context["source_commit_sha"] or run["event"] != context["event"]:
+        raise ValueError("GitHub run does not match this workflow")
+    trigger = request_for_run(run)
+    if context["event"] == "push" and args.trigger.is_file():
+        query = urlencode({"path": args.trigger.as_posix(), "sha": context["source_commit_sha"], "per_page": 1})
+        changes = gh_api(f"{repo_path}/commits?{query}")
+        if changes and changes[0]["sha"] == context["source_commit_sha"]:
+            trigger = json.loads(args.trigger.read_text(encoding="utf-8"))
     summary = json.loads((args.output / "summary.json").read_text())
     tag = f"data-{summary['as_of_date']}-{context['run_id']}-{context['run_attempt']}"
-    release = gh_api(f"repos/{context['repository']}/releases/tags/{tag}")
+    release = gh_api(f"{repo_path}/releases/tags/{tag}")
     snapshot = build_handoff(args.output / PACK_NAME, trigger, context, release)
     encoded = base64.b64encode(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).decode()
-    path = f"repos/{context['repository']}/contents/{HANDOFF_PATH}"
+    path = f"{repo_path}/contents/{HANDOFF_PATH}"
     previous = gh_api(path + "?ref=main", allow_missing=True)
     request = {"message": f"Publish validated morning input {snapshot['data']['as_of_date']} (run {context['run_id']})",
                "content": encoded, "branch": "main"}

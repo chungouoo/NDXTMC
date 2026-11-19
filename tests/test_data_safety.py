@@ -12,7 +12,8 @@ from threading import Thread
 
 from scripts.morning_pack import (
     DataError, anomalies, breadth_metrics, build_pack, csv_bytes, latest_completed_session,
-    generate, NasdaqClient, number, parse_index, parse_members, parse_stock, parse_yahoo_stock, trade_date, wilder_rsi_series,
+    generate, NasdaqClient, number, parse_index, parse_members, parse_stock, parse_yahoo_stock,
+    trade_date, wilder_rsi_series, YahooClient,
 )
 from scripts.validate_pack import audit
 
@@ -159,6 +160,33 @@ class DataSafetyTests(unittest.TestCase):
         bad["chart"]["result"][0]["meta"]["firstTradeDate"] = int(datetime(2025,1,2,tzinfo=timezone.utc).timestamp())
         with self.assertRaisesRegex(DataError,"truncated"):
             parse_yahoo_stock(bad, "TEST", "2026-11-16")
+
+    def test_truncated_yahoo_history_uses_checked_overlap_and_live_latest_row(self):
+        payload = self.yahoo_payload()
+        payload["chart"]["result"][0]["meta"]["firstTradeDate"] = int(datetime(2026, 11, 12, 14, 30, tzinfo=timezone.utc).timestamp())
+        previous = {"TEST": [
+            {"Date": "2026-11-12", "Open": 98, "High": 99, "Low": 97, "Close": 98, "Volume": 110},
+            {"Date": "2026-11-13", "Open": 99, "High": 101, "Low": 98, "Close": 100, "Volume": 90},
+        ]}
+        with tempfile.TemporaryDirectory() as folder:
+            raw = Path(folder)
+            handoff = raw / "last.json"
+            handoff.touch()
+            client = YahooClient(raw, previous_handoff=handoff)
+            with patch.object(client, "request", return_value=payload), patch(
+                    "scripts.morning_pack.read_previous_yahoo_pack", return_value=(previous, {"as_of_date": "2026-11-13"})):
+                rows = client.stock("TEST", "2026-11-16")
+                self.assertEqual([row["Close"] for row in rows], [98, 100, 102])
+                self.assertEqual(rows[1]["Volume"], 100)
+                self.assertEqual(client.history_recoveries["TEST"]["carried_sessions"], 1)
+                self.assertEqual(client.history_recoveries["TEST"]["overlap_volume_revisions"], 1)
+                self.assertEqual(client.history_recoveries["TEST"]["overlap_dates"], ["2026-11-13"])
+                previous["TEST"][1]["Close"] = 50
+                with self.assertRaisesRegex(DataError, "Yahoo OHLC conflict"):
+                    client.stock("TEST", "2026-11-16")
+                previous["TEST"].pop()
+                with self.assertRaisesRegex(DataError, "does not overlap"):
+                    client.stock("TEST", "2026-11-16")
 
     def test_breadth_cannot_mix_stock_data_providers(self):
         index_rows = [{"Date":"2026-11-13", "Close":100, "Constituents":2}, {"Date":"2026-11-16", "Close":101, "Constituents":2}]

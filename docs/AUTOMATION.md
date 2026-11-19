@@ -1,22 +1,20 @@
 # 每日自动晨报流程
 
-开始日期：2026-11-18。时区：Asia/Shanghai。
+时区为 Asia/Shanghai。
 
-每天 08:00 由原「纳指晨报」任务启动，顺序执行：
+1. 07:23 由 GitHub Actions 定时取数，获取 Nasdaq 指数与成分名单以及整组个股日线。
+2. 独立验算 ZIP、核对交易日、覆盖率和 manifest。发布 Release 后，工作流原子写入 `data/latest_morning_input.json`。
+3. 08:00 原「纳指晨报」任务只读核对当天交接与对应的成功运行，复算 RSI、均线、回撤和相对表现，并核实 VIX、VXN、CNN 情绪、利率、估值和新闻。
+4. 依照原有研究与风险规则，在原晨报对话推送完整分析与数据来源。
 
-1. 更新 `.github/ndxtmc-trigger.json`；同一北京时间日期按 request_id 去重。
-2. 运行 GitHub 工作流，获取 Nasdaq 指数与名单，按当前策略获取整组个股数据。
-3. 独立验算 ZIP、核对当期日期/覆盖率/manifest，发布 Release。
-4. 工作流原子发布 `data/latest_morning_input.json`，明确 READY、触发身份、提交、run_id、Release、实际交易日和供应商。
-5. 同一个晨报任务等待此轮成功后读取 JSON，独立复算 RSI/均线/回撤/相对表现，并核实 VIX、VXN、CNN情绪、利率、估值和新闻。
-6. 依照原有研究与风险规则，在原晨报对话推送完整分析和数据来源链接。
+定时运行的请求 ID 为 `ndxtmc-daily-YYYY-MM-DD`，日期以对应 GitHub 运行创建时间换算为北京时间。iPhone 手动补跑使用该次运行的独立请求 ID。旧触发文件仅在该文件实际被本次提交更新时用于其原有方式。
 
-08:00 是开始时间；完成时间取决于数据源与研究耗时。单独的 08:00 数据包任务合并停用，避免重复触发；其他晨报任务保持原配置。
+08:00 为报告任务开始时间。GitHub 排队、取数和研究的用时会影响实际送达时间。
 
 ## 准入条件
 
 - 仓库仍为 Public，使用标准免费 Linux 运行器，不新增付费 API 或服务器。
-- 只能接受本轮 request_id、source_commit_sha 和 run_id 匹配的交接文件。
+- 核对当日交接的 request_id、source_commit_sha 和 run_id 与实际成功运行相符。
 - beijing_request_date 必须属于本轮日期；实际行情日期允许为最近已完成交易日，休市时明确说明。
 - DAILY_READY、Quality Gate、校验结果和完整成分覆盖率全部通过。历史回放、日期冲突、缺失成分、审计错误不能进入正式最新数据分析。
 - 指数源与个股供应商必须如实披露；不把 Yahoo 个股历史冒充 Nasdaq 官方个股历史。
