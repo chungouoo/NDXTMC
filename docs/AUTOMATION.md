@@ -2,7 +2,7 @@
 
 时区为 Asia/Shanghai。
 
-1. 07:23 由 GitHub Actions 定时取数，获取 Nasdaq 指数与成分名单以及整组个股日线。
+1. 07:23 由 GitHub Actions 定时取数，获取 Nasdaq 指数与成分名单以及整组个股日线。07:41 有第二次定时检查，已有当日成功交接时跳过重新取数。
 2. 独立验算 ZIP、核对交易日、覆盖率和 manifest。发布 Release 后，工作流原子写入 `data/latest_morning_input.json`。
 3. 08:00 原「纳指晨报」任务只读核对当天交接与对应的成功运行，复算 RSI、均线、回撤和相对表现，并核实 VIX、VXN、CNN 情绪、利率、估值和新闻。
 4. 依照原有研究与风险规则，在原晨报对话推送完整分析与数据来源。

@@ -13,7 +13,7 @@ from threading import Thread
 from scripts.morning_pack import (
     DataError, anomalies, breadth_metrics, build_pack, csv_bytes, latest_completed_session,
     generate, NasdaqClient, number, parse_index, parse_members, parse_stock, parse_yahoo_stock,
-    trade_date, wilder_rsi_series, YahooClient,
+    trade_date, verify_yahoo_public_close, wilder_rsi_series, YahooClient,
 )
 from scripts.validate_pack import audit
 
@@ -160,6 +160,28 @@ class DataSafetyTests(unittest.TestCase):
         bad["chart"]["result"][0]["meta"]["firstTradeDate"] = int(datetime(2025,1,2,tzinfo=timezone.utc).timestamp())
         with self.assertRaisesRegex(DataError,"truncated"):
             parse_yahoo_stock(bad, "TEST", "2026-11-16")
+
+    def test_target_null_close_requires_a_matching_explicit_regular_close(self):
+        payload = self.yahoo_payload()
+        data = payload["chart"]["result"][0]
+        data["indicators"]["quote"][0]["close"][-1] = None
+        close_time = int(datetime(2026, 11, 16, 21, 0, 1, tzinfo=timezone.utc).timestamp())
+        data["meta"].update(regularMarketPrice=102, regularMarketTime=close_time)
+        page = ('<link rel="canonical" href="https://finance.yahoo.com/quote/TEST/history/">'
+                '<section data-testid="price-statistic"><span data-testid="qsp-price">102.00</span>'
+                '<span class="marketTimeNotice">At close: November 16 at 4:00:01 PM EST</span></section>')
+        confirm = lambda meta: verify_yahoo_public_close(page, "TEST", "2026-11-16", meta)[0]
+        rows = parse_yahoo_stock(payload, "TEST", "2026-11-16", verified_close=confirm)
+        self.assertEqual(rows[-1]["Close"], 102)
+        for bad in (page.replace("November 16", "November 13"), page.replace("At close", "After hours"),
+                    page.replace("102.00", "103.00"), page.replace("/TEST/", "/OTHER/")):
+            with self.assertRaises(DataError):
+                verify_yahoo_public_close(bad, "TEST", "2026-11-16", data["meta"])
+        with self.assertRaises(DataError):
+            verify_yahoo_public_close(page, "TEST", "2026-11-16", {**data["meta"], "regularMarketTime": close_time - 300})
+        data["indicators"]["quote"][0]["close"][0] = None
+        with self.assertRaisesRegex(DataError, "Yahoo null close on 2026-11-13"):
+            parse_yahoo_stock(payload, "TEST", "2026-11-16", verified_close=confirm)
 
     def test_truncated_yahoo_history_uses_checked_overlap_and_live_latest_row(self):
         payload = self.yahoo_payload()

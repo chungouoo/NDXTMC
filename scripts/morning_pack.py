@@ -18,11 +18,13 @@ import statistics
 import sys
 import time
 import zipfile
+from collections.abc import Callable
 from http.cookiejar import CookieJar
 from threading import Lock, local
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -241,7 +243,8 @@ def parse_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     return rows
 
 
-def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
+def parse_yahoo_stock(payload: dict, ticker: str, target: str, *,
+                      verified_close: Callable[[dict], float] | None = None) -> list[dict]:
     """Read Yahoo provider Close, never substitute its dividend-adjusted close."""
     chart = payload.get("chart") or {}
     result = chart.get("result")
@@ -264,10 +267,15 @@ def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     provider_rows = []
     for i, timestamp in enumerate(timestamps):
         stamp = datetime.fromtimestamp(number(timestamp), timezone.utc).astimezone(NY)
-        for key in keys:
-            if quote[key][i] is None:
+        bar = {key: quote[key][i] for key in keys}
+        for key, value in bar.items():
+            if value is None:
+                if key == "close" and stamp.date().isoformat() == target and verified_close is not None:
+                    continue
                 raise DataError(f"{ticker}: Yahoo null {key} on {stamp.date().isoformat()} (target={target}); no substitute price")
-        provider_rows.append({"date": stamp.strftime("%m/%d/%Y"), **{k: quote[k][i] for k in keys}})
+        if bar["close"] is None:
+            bar["close"] = verified_close(meta)
+        provider_rows.append({"date": stamp.strftime("%m/%d/%Y"), **bar})
     # Reuse the same OHLC, coverage, date and continuity validation for both vendors.
     rows = parse_stock({"data": {"symbol": ticker, "totalRecords": len(timestamps), "tradesTable": {"rows": provider_rows}}}, ticker, target)
     first_trade = datetime.fromtimestamp(number(meta.get("firstTradeDate")), timezone.utc).astimezone(NY).date().isoformat()
@@ -280,6 +288,34 @@ def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     if rows[0]["Date"] > sessions[0]:
         raise TruncatedYahooHistory(ticker, rows, sessions[0])
     return rows
+
+
+def verify_yahoo_public_close(html: str, ticker: str, target: str, meta: dict) -> tuple[float, str]:
+    expected_close = calendar().session_close(target).to_pydatetime()
+    quote_time = datetime.fromtimestamp(number(meta.get("regularMarketTime")), timezone.utc)
+    if abs((quote_time - expected_close).total_seconds()) > 60:
+        raise DataError(f"{ticker}: Yahoo regular quote is not timed to the target session close")
+    page = re.search(r'<link\b[^>]*\brel="canonical"[^>]*\bhref="([^"]+)"', html)
+    if not page or page[1] != f"https://finance.yahoo.com/quote/{ticker}/history/":
+        raise DataError(f"{ticker}: Yahoo close page identity mismatch")
+    section = re.search(r'<section\b[^>]*data-testid="price-statistic"[^>]*>(.*?)</section>', html, re.DOTALL)
+    if not section:
+        raise DataError(f"{ticker}: Yahoo regular quote section was not found")
+    price = re.search(r'data-testid="qsp-price">\s*([0-9,.]+)\s*</span>', section[1])
+    notice = re.search(r'<span\b[^>]*class="[^"]*\bmarketTimeNotice\b[^"]*"[^>]*>\s*(At close:[^<]+)</span>', section[1])
+    if not price or not notice:
+        raise DataError(f"{ticker}: Yahoo page does not explicitly publish a regular-session close")
+    local = expected_close.astimezone(NY)
+    equated_notice = " ".join(unescape(notice[1]).split())
+    day = re.escape(f"{local:%B} {local.day}")
+    clock = re.escape(f"{local:%I:%M}".lstrip("0"))
+    timezone_name = re.escape(local.tzname())
+    if not re.fullmatch(rf"At close: {day} at {clock}(?::[0-5]\d)? {local:%p} {timezone_name}", equated_notice):
+        raise DataError(f"{ticker}: Yahoo page close date/time does not match {target}")
+    displayed = number(price[1])
+    if not math.isclose(displayed, number(meta.get("regularMarketPrice")), rel_tol=0, abs_tol=0.0051):
+        raise DataError(f"{ticker}: Yahoo page close disagrees with the Yahoo regular quote on {target}")
+    return displayed, equated_notice
 
 
 def read_previous_yahoo_pack(handoff: Path) -> tuple[dict[str, list[dict]], dict]:
@@ -420,6 +456,23 @@ class YahooClient(NasdaqClient):
         self.previous_pack = None
         self.previous_pack_lock = Lock()
         self.history_recoveries: dict[str, dict] = {}
+        self.close_recoveries: dict[str, dict] = {}
+
+    def public_close(self, ticker: str, target: str, meta: dict) -> float:
+        url = f"https://finance.yahoo.com/quote/{ticker}/history/"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html", "Accept-Language": "en-US"})
+        with urlopen(request, timeout=18) as response:
+            raw = response.read(4_000_001)
+        if len(raw) > 4_000_000:
+            raise DataError(f"{ticker}: Yahoo close page response too large")
+        close, notice = verify_yahoo_public_close(raw.decode("utf-8"), ticker, target, meta)
+        record = {"ticker": ticker, "date": target, "close": close, "source_url": url, "notice": notice,
+                  "page_sha256": hashlib.sha256(raw).hexdigest(), "chart_regular_market_time": meta["regularMarketTime"]}
+        write_json(self.raw_dir / f"yahoo_public_close_{ticker}.json", record)
+        with self.previous_pack_lock:
+            self.close_recoveries[ticker] = record
+        print(f"{ticker}: confirmed {target} regular-session close on Yahoo Finance", flush=True)
+        return close
 
     def stock(self, ticker: str, target: str):
         start = int(datetime(2025, 1, 2, tzinfo=NY).timestamp())
@@ -429,7 +482,8 @@ class YahooClient(NasdaqClient):
         })
         payload = self.request(url, f"raw_yahoo_stock_{ticker}.json")
         try:
-            return parse_yahoo_stock(payload, ticker, target)
+            return parse_yahoo_stock(payload, ticker, target,
+                                     verified_close=lambda meta: self.public_close(ticker, target, meta))
         except TruncatedYahooHistory as short:
             if self.previous_handoff is None or not self.previous_handoff.is_file():
                 raise
@@ -543,7 +597,8 @@ def anomalies(stocks: dict[str, list[dict]]) -> list[dict]:
 
 
 def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict[str, list[dict]], target: str, now: datetime, *,
-               replay: bool = False, stock_source_note: str | None = None, stock_history_recovery: list[dict] | None = None) -> tuple[dict[str, bytes], dict]:
+               replay: bool = False, stock_source_note: str | None = None, stock_history_recovery: list[dict] | None = None,
+               stock_close_recovery: list[dict] | None = None) -> tuple[dict[str, bytes], dict]:
     count = len(members)
     if set(stocks) != {m["Symbol"] for m in members} or count != indices["NDXTMC"][-1]["Constituents"]:
         raise DataError("Constituent identity/count differs from downloaded stock universe")
@@ -589,6 +644,9 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
         warnings.append("YAHOO_PROVIDER_CLOSE: chart quote.close, not adjclose; provider may revise split adjustments; no local adjustment applied")
     for item in stock_history_recovery or []:
         warnings.append(f"YAHOO_HISTORY_RECOVERED: {item['ticker']} used {item['carried_sessions']} earlier sessions from a checksum-verified Yahoo pack; matched live OHLC overlap and uses live rows from {item['first_live_date']}")
+    if stock_close_recovery:
+        tickers = ", ".join(item["ticker"] for item in stock_close_recovery)
+        warnings.append(f"YAHOO_REGULAR_CLOSE_VERIFIED: chart Close was null for {tickers}; used Yahoo Finance explicitly dated At close prices confirmed against the same provider's regular-session quote")
     warnings.extend(f"REVIEWED_SNAPSHOT_EXTREME: {r['Ticker']} {r['Date']} {r['ChangePct']:.2f}%" for r in anomaly_rows if not r["Note"].startswith("UNREVIEWED"))
     for n in PERIODS:
         if breadth[f"above_ma{n}_valid_count"] != count:
@@ -618,6 +676,8 @@ def build_pack(indices: dict[str, list[dict]], members: list[dict], stocks: dict
                "membership": {"as_of_date": target, "component_count": count, "components": members, "weights_available": False}}
     if stock_history_recovery:
         summary["source_policy"]["stock_history_recovery"] = stock_history_recovery
+    if stock_close_recovery:
+        summary["source_policy"]["stock_close_recovery"] = stock_close_recovery
     for ticker in ("NDXT", "NDX"):
         item = indicators[ticker][-1]
         summary[ticker] = {"close": item["Close"], **{f"return_{n}d_pct": item[f"return_{n}d_pct"] for n in (1, 5, 20)}}
@@ -705,10 +765,13 @@ def generate(output: Path, fixtures: Path | None = None, as_of: str | None = Non
         write_json(output / "failed_tickers.json", failures)
         raise DataError(f"{len(failures)}/{len(members)} stock sources failed; no current pack will be published: " + "; ".join(f"{row['Ticker']}: {row['Error']}" for row in failures[:8]))
     recovered = []
+    closes_recovered = []
     if isinstance(stock_client, YahooClient):
         recovered = [stock_client.history_recoveries[ticker] for ticker in sorted(stock_client.history_recoveries)]
+        closes_recovered = [stock_client.close_recoveries[ticker] for ticker in sorted(stock_client.close_recoveries)]
     files, summary = build_pack(indices, members, stocks, target, now, replay=bool(fixtures),
-                                stock_source_note=stock_source_note, stock_history_recovery=recovered)
+                                stock_source_note=stock_source_note, stock_history_recovery=recovered,
+                                stock_close_recovery=closes_recovered)
     if summary["quality"]["critical"]:
         write_json(output / "blocked_quality.json", summary["quality"])
         raise DataError("Quality gate blocked: " + "; ".join(summary["quality"]["critical"]))

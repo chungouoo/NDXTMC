@@ -2,8 +2,9 @@ name: iPhone 一键生成晨报数据包
 
 "on":
   schedule:
-    - cron: '23 7 * * *'
-      timezone: Asia/Shanghai
+    # UTC: 07:23 and 07:41 the next day in Asia/Shanghai.
+    - cron: '23 23 * * *'
+    - cron: '41 23 * * *'
   workflow_dispatch:
   public:
   push:
@@ -39,21 +40,48 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check for a successful handoff today
+        id: today
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          today=$(TZ=Asia/Shanghai date +%F)
+          if payload=$(gh api "repos/$GH_REPO/contents/data/latest_morning_input.json?ref=main" --jq .content | base64 --decode) &&
+             completed_run=$(jq -r --arg today "$today" '
+               select(.beijing_request_date == $today and .status == "READY"
+                 and .data.daily_ready == true and .validation.errors == []
+                 and .manifest.quality_gate == "PASS" and .manifest.source_mode == "LIVE")
+               | .pipeline.run_id' <<< "$payload") &&
+             [[ "$completed_run" =~ ^[0-9]+$ ]] &&
+             conclusion=$(gh api "repos/$GH_REPO/actions/runs/$completed_run" --jq .conclusion) &&
+             [[ "$conclusion" == success ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Python
+        if: steps.today.outputs.ready != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
       - name: Install pinned dependencies without an Actions cache
+        if: steps.today.outputs.ready != 'true'
         run: python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
 
       - name: Test market sessions and data failure checks
+        if: steps.today.outputs.ready != 'true'
         run: python -m unittest discover -s tests -v
 
       - name: Download and independently validate the latest completed session
+        if: steps.today.outputs.ready != 'true'
         run: python -m scripts.morning_pack --output output
 
       - name: Publish downloadable data pack
+        if: steps.today.outputs.ready != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -79,6 +107,7 @@ jobs:
           printf '\n[下载最新 ZIP](https://github.com/%s/releases/latest/download/LATEST_Morning_Report_Data_Pack.zip)\n' "$GH_REPO" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish validated input for the morning report
+        if: steps.today.outputs.ready != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
