@@ -354,7 +354,7 @@ class NasdaqClient:
         if self.fixtures:
             payload = json.loads((self.fixtures / filename).read_text())
         else:
-            yahoo = urlsplit(url).hostname in ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+            yahoo = urlsplit(url).hostname == "query1.finance.yahoo.com"
             provider = "Yahoo Finance" if yahoo else "Nasdaq"
             origin = "https://finance.yahoo.com" if yahoo else "https://www.nasdaq.com"
             data = urlencode(params).encode() if params is not None else None
@@ -424,7 +424,7 @@ class YahooClient(NasdaqClient):
     def stock(self, ticker: str, target: str):
         start = int(datetime(2025, 1, 2, tzinfo=NY).timestamp())
         end = int(datetime.combine(date.fromisoformat(target) + timedelta(days=1), datetime.min.time(), NY).timestamp())
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?" + urlencode({
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?" + urlencode({
             "period1": start, "period2": end, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true",
         })
         payload = self.request(url, f"raw_yahoo_stock_{ticker}.json")
