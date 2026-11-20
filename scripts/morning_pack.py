@@ -264,6 +264,9 @@ def parse_yahoo_stock(payload: dict, ticker: str, target: str) -> list[dict]:
     provider_rows = []
     for i, timestamp in enumerate(timestamps):
         stamp = datetime.fromtimestamp(number(timestamp), timezone.utc).astimezone(NY)
+        for key in keys:
+            if quote[key][i] is None:
+                raise DataError(f"{ticker}: Yahoo null {key} on {stamp.date().isoformat()} (target={target}); no substitute price")
         provider_rows.append({"date": stamp.strftime("%m/%d/%Y"), **{k: quote[k][i] for k in keys}})
     # Reuse the same OHLC, coverage, date and continuity validation for both vendors.
     rows = parse_stock({"data": {"symbol": ticker, "totalRecords": len(timestamps), "tradesTable": {"rows": provider_rows}}}, ticker, target)
