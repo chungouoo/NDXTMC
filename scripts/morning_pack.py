@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -334,8 +335,18 @@ def read_previous_yahoo_pack(handoff: Path) -> tuple[dict[str, list[dict]], dict
     url = f"https://github.com/{repo}/releases/download/{tag}/LATEST_Morning_Report_Data_Pack.zip"
     if pipeline["repository"] != repo or pipeline["zip_url"] != url or not re.fullmatch(r"data-\d{4}-\d{2}-\d{2}-\d+-\d+", tag):
         raise DataError("Previous pack does not match the repository release")
-    with urlopen(url, timeout=25) as response:
-        packed = response.read(16_000_001)
+    # The previous-pack ZIP is fetched over plain urlopen with no retry wrapper
+    # of its own; a transient connection drop here must be retried, not fatal.
+    packed = None
+    for attempt in range(3):
+        try:
+            with urlopen(url, timeout=25) as response:
+                packed = response.read(16_000_001)
+            break
+        except (URLError, TimeoutError, HTTPException, ConnectionError) as exc:
+            if attempt == 2:
+                raise DataError("Previous pack download failed after 3 attempts") from exc
+            time.sleep(attempt + 1)
     digest = hashlib.sha256(packed).hexdigest()
     if len(packed) > 16_000_000 or digest != pipeline["zip_sha256"]:
         raise DataError("Previous pack ZIP checksum mismatch")
@@ -419,7 +430,11 @@ class NasdaqClient:
                     if exc.code not in (500, 502, 503, 504) or attempt == 2:
                         raise DataError(f"{provider} HTTP {exc.code}; no permission/rate-limit bypass") from exc
                     time.sleep(attempt + 1)
-                except (URLError, TimeoutError) as exc:
+                except (URLError, TimeoutError, HTTPException, ConnectionError) as exc:
+                    # RemoteDisconnected / BadStatusLine / reset connections surface
+                    # here, not as URLError: without this they abort the run on the
+                    # first transient drop instead of being retried like other
+                    # temporary network failures.
                     if attempt == 2:
                         raise DataError(f"{provider} network request failed after 3 attempts") from exc
                     time.sleep(attempt + 1)
@@ -461,8 +476,18 @@ class YahooClient(NasdaqClient):
     def public_close(self, ticker: str, target: str, meta: dict) -> float:
         url = f"https://finance.yahoo.com/quote/{ticker}/history/"
         request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html", "Accept-Language": "en-US"})
-        with urlopen(request, timeout=18) as response:
-            raw = response.read(4_000_001)
+        raw = None
+        for attempt in range(3):
+            try:
+                with urlopen(request, timeout=18) as response:
+                    raw = response.read(4_000_001)
+                break
+            except (URLError, TimeoutError, HTTPException, ConnectionError) as exc:
+                # Same transient-drop class as in NasdaqClient.request: a single
+                # reset connection must not fail the whole run for one ticker.
+                if attempt == 2:
+                    raise DataError(f"{ticker}: Yahoo close page request failed after 3 attempts") from exc
+                time.sleep(attempt + 1)
         if len(raw) > 4_000_000:
             raise DataError(f"{ticker}: Yahoo close page response too large")
         close, notice = verify_yahoo_public_close(raw.decode("utf-8"), ticker, target, meta)
