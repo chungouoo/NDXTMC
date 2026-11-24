@@ -13,7 +13,7 @@
 1. GitHub App 中打开 `NDXTMC → Actions → iPhone 一键生成晨报数据包`。也可用手机浏览器打开上方「运行数据更新」。
 2. 点 **运行工作流 / Run workflow**，分支选 **main**，再确认运行。若浏览器隐藏了按钮，可用 Safari 的「请求桌面网站」。
 3. 等待运行完成、显示绿色成功，再打开「查看数据日期与校验结果」。
-4. 确认 **美股交易日**，下载 `LATEST_Morning_Report_Data_Pack.zip`，在 Safari 下载列表或「文件」App 中找到它，然后上传给 ChatGPT 生成晨报。
+4. 确认 **美股交易日**，下载 `LATEST_Morning_Report_Data_Pack.zip`，在 Safari 下载列表或「文件」App 中找到它，然后上传给 ChatGPT 生成晨报；也可以发给 Muse（bowbow）核验，核验通过后直接写进 NDXTMC + NDX 驾驶舱。
 
 成功运行耗时取决于数据源响应；工作流最多运行 15 分钟。页面关闭后云端会继续。**下载链接指向最近一次成功结果**，失败时不会伪装成更新成功，请始终核对 Release 中的交易日。
 
